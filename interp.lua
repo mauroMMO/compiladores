@@ -123,7 +123,8 @@ local grammar = lpeg.P{"prog",
 
   prog = space * lpeg.Ct((funcDec + globalDec)^1) * -1,
 
-  globalDec = Rw"global" * ID * ty / node("global", "name", "ty"),
+  globalDec = Rw"global" * ID * T":" * ty * T";"
+                 / node("global", "name", "ty"),
 
   ty = Rw"int" * lpeg.Cc("int") / node("basictype", "ty")
      + Rw"array" * ty / node("array", "elem"),
@@ -306,6 +307,9 @@ end
 
 
 function Compiler:searchLocal (name)
+  if(self.vars[name]) then
+    return self.vars[name]
+  end
   for i = #self.locals, 1, -1 do
     if self.locals[i].name == name then
       return self.locals[i]
@@ -442,6 +446,9 @@ function Compiler:codeStat (ast)
       end
       self:emit("store %s %s, %s* %s\n", lety, ast.e.res, lety, ast.idx)
     end
+    if(self:searchLocal(ast.name)) then
+      throw("existing var name")
+    end
     self.locals[#self.locals + 1] = ast
   elseif tag == "while" then
     local Linit = self:newlabel()
@@ -527,14 +534,14 @@ function Compiler:codeExp (ast)
   if tag == "number" then
     ast.res = string.format("%d", ast.val)
     ty = intTy
-  elseif tag == "var" then
+  elseif (tag == "var" or tag=="global") then
     local loc = self:searchLocal(ast.id)
     if loc then
       ty = loc.ty
       ast.res = self:emit("%r1 = load %s, %s* %s\n",
                 type2VM(ty), type2VM(ty), loc.idx)
-    else
-      self:addCode("loadG", self:name2idx(ast.id))
+    --else
+     -- self:addCode("loadG", self:name2idx(ast.id))
     end
   elseif tag == "indexed" then
     local aty = self:codeExp(ast.array)
@@ -609,6 +616,11 @@ function Compiler:codeExp (ast)
   return ty
 end
 
+function Compiler:codeGlobal(ast)
+  ast.idx = "@" .. ast.name
+  self:emit("%s = dso_local global i32 0\n\n", ast.idx)
+  self.vars[ast.name] = ast
+end
 
 function Compiler:codeFunc (ast)
   self.code = {}
@@ -650,7 +662,11 @@ declare i32 @printf(i8*, ...)
 
 ]]
   for i = 1, #ast do
-    Compiler:codeFunc(ast[i])
+    if ast[i].tag == "global" then 
+      Compiler:codeGlobal(ast[i])
+    else
+      Compiler:codeFunc(ast[i])
+    end
   end
   local main = Compiler.funcs["main"]
   if not main then
@@ -660,7 +676,7 @@ declare i32 @printf(i8*, ...)
 end
 
 
------------------------------------------------------------
+---------------------------------------------------------------
 
 local input = io.read("*a")
 for i = 1, #arg do arg[arg[i]] = i end
