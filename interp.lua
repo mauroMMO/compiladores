@@ -3,6 +3,17 @@ local lpeg = require "lpeg"
 local pt = require "pt"
 
 -----------------------------------------------------------
+
+local ops = {["+"] = "add", ["-"] = "sub",
+             ["*"] = "mul", ["/"] = "div", ["%"] = "mod"
+}
+
+local opsComp = {["<"] = "slt",["<="]="sle",
+                [">"] = "sgt",[">="]="sge",
+                ["="] = "eq",["~="]="ne"
+}
+
+
 local function I (msg)
   return lpeg.P(function () print(msg); return true end)
 end
@@ -14,19 +25,10 @@ local function throw (msg)
 end
 
 
-local floatTy = {tag = "basictype", ty = "float"}
+local intTy = {tag = "basictype", ty = "int"}
 -----------------------------------------------------------
 
 local parser
-local globals
-
-local function idxGlobals()
-  for i = 0, #globals, 1 do
-    if globals[i] then
-      globals[i].idx = i
-    end
-  end
-end
 
 do
 
@@ -42,6 +44,7 @@ local function node (tag, ...)
   end
 end
 
+
 local function opL (term, op, tag)
   return lpeg.Cf(term * lpeg.Cg(op * term)^0,
                    node(tag, "e1", "op", "e2"))
@@ -51,6 +54,9 @@ local function binOpL (term, op)
   return opL(term, op, "binop")
 end
 
+local function binOpComp(term,op)
+  return opL(term, op, "binopComp")
+end
 
 local alpha = lpeg.R("az", "AZ", "__")
 local digit = lpeg.R("09")
@@ -106,32 +112,29 @@ local args = lpeg.V("args")
 local params = lpeg.V("params")
 local param = lpeg.V("param")
 local funcDec = lpeg.V("funcDec")
+local globalDec = lpeg.V("globalDec")
 local retty = lpeg.V("retty")
 local lhs = lpeg.V("lhs")
 local ty = lpeg.V("ty")
-local init = lpeg.V("init")
-local global = lpeg.V("global")
-local prog = lpeg.V("prog")
+
 local exp = disjunction
 
-local grammar = lpeg.P{"program",
+local grammar = lpeg.P{"prog",
 
-  program = lpeg.Ct(init * prog),
+  prog = space * lpeg.Ct((funcDec + globalDec)^1) * -1,
 
-  init = space* Rw"init" * T "{" *lpeg.Ct((global * (global)^0)^-1)*T"}",
+  globalDec = Rw"global" * ID * T":" * ty * T";"
+                 / node("global", "name", "ty"),
 
-  global = Rw"global" * ID * T":" * ty * (T"=" * exp)^-1 * T";"
-  / node("global", "name", "ty", "e"),
-
-  prog = space * lpeg.Ct(funcDec^1) * -1,
-
-  ty = Rw"float" * lpeg.Cc("float") / node("basictype", "ty")
+  ty = Rw"int" * lpeg.Cc("int") / node("basictype", "ty")
      + Rw"array" * ty / node("array", "elem"),
 
   funcDec = Rw"func" * ID * T"(" * params * T")" * retty * block /
-              node("func", "name", "params", "retty", "body"),
+              node("func", "name", "params", "retty", "body")
+              +Rw"func" * ID * T"(" * params * T")" * retty * T";"/
+              node("funcDec", "name", "params", "retty"),
 
-  retty = T":" * ty + lpeg.Cc(floatTy),
+  retty = T":" * ty + lpeg.Cc(intTy),
 
   params = lpeg.Ct((param * (T"," * param)^0)^-1),
 
@@ -175,7 +178,7 @@ local grammar = lpeg.P{"program",
 
   sum = binOpL(product, opA),
 
-  comparison = binOpL(sum, opC),
+  comparison = binOpComp(sum, opC),
 
   conjunction = opL(comparison, Op"&&", "conj"),
 
@@ -198,7 +201,69 @@ end
 
 end
 -----------------------------------------------------------
-local Compiler = { funcs = {}, vars = {}, nvars = 0 }
+local Compiler = { funcs = {}, vars = {}, nvars = 0,funcsDec = {} }
+
+
+function Compiler:newcount ()
+  local count = self.count
+  self.count = count + 1
+  return count
+end
+
+
+local function count2reg (count)
+  return string.format("%%T%d", count)
+end
+
+
+function Compiler:newreg ()
+  return count2reg(self:newcount())
+end
+
+function Compiler:verifyFn(flag,ast)
+  if flag =="dec" then
+    fn = self.funcsDec[ast.name]
+    if fn then
+      throw("function already declared")
+      return false
+    end
+  else
+    fn = self.funcsDec[ast.name]
+    if fn then
+      if #ast.params ~= #fn.params then
+        throw("wrong number of params")
+        return false
+      end
+      for i = 1, #ast.params do
+        if (ast.params[i].ty.ty~=fn.params[i].ty.ty) then
+          throw("wrong type")
+          return false
+        end
+      end
+      if ast.retty.ty ~=fn.retty.ty then
+        throw("wrong return type")
+        return false
+      end
+    end
+    if self.funcs[ast.name] then
+      throw("function already defined")
+      return false
+    end
+  end
+  return true
+end
+
+function Compiler:newlabel ()
+  return string.format("L%d", self:newcount())
+end
+
+function Compiler:codeLabel (label)
+  label = label or self:newlabel()
+  self:emit("\n%s:\n", label)
+  self.currentlabel = label
+  return label
+end
+
 
 function Compiler:name2idx (name)
   local idx = self.vars[name]
@@ -218,74 +283,67 @@ function Compiler:addCode (...)
   end
 end
 
-local function newlabel ()
-  return {}
-end
 
-
-function Compiler:addJmp (jmp, label)
-  self:addCode(jmp)
-  self:addCode(0)
-  label[#label + 1] = #self.code
-end
-
-function Compiler:fixlabel2target (label, target)
-  for _, jmp in ipairs(label) do
-    self.code[jmp] = target - jmp
-  end
-end
-
-function Compiler:fixlabel2here (label)
-  self:fixlabel2target(label, #self.code)
-end
-
-
-function Compiler:codeJmpFalse (ast, label)
-  local tag = ast.tag
-  if tag == "not" then
-    self:codeJmpTrue(ast.e, label)
-  elseif tag == "conj" then
-    self:codeJmpFalse(ast.e1, label)
-    self:codeJmpFalse(ast.e2, label)
-  elseif tag == "disj" then
-    local labelEnd = newlabel()
-    self:codeJmpTrue(ast.e1, labelEnd)
-    self:codeJmpFalse(ast.e2, label)
-    self:fixlabel2here(labelEnd)
-  else
-    self:codeFloatExp(ast)
-    self:addJmp("IfZJmp", label)
-  end
-end
-
-
-function Compiler:codeJmpTrue (ast, label)
-  local tag = ast.tag
-  if tag == "not" then
-    self:codeJmpFalse(ast.e, label)
-  elseif tag == "disj" then
-    self:codeJmpTrue(ast.e1, label)
-    self:codeJmpTrue(ast.e2, label)
-  elseif tag == "conj" then
-    local labelEnd = newlabel()
-    self:codeJmpFalse(ast.e1, labelEnd)
-    self:codeJmpTrue(ast.e2, label)
-    self:fixlabel2here(labelEnd)
-  else
-    self:codeFloatExp(ast)
-    self:addJmp("IfNZJmp", label)
-  end
-end
-
-function Compiler:searchGlobal (name)
-  for i = #globals, 1, -1 do
-    if globals[i].name == name then
-      return globals[i]
+function Compiler:preprocess (fmt)
+  local lastdefined
+  local regs = {}
+  fmt = string.gsub(fmt, "%%r(%d) *(=?)", function(reg,def)
+    if def == "=" then
+      lastdefined = self:newreg()
+      regs[reg] = lastdefined
     end
-  end
-  return -1
+    return string.format("%%%s %s", regs[reg], def)
+  end)
+  return fmt, lastdefined
 end
+
+
+function Compiler:emit (fmt, ...)
+  local fmt, res = self:preprocess(fmt)
+  io.write(string.format(fmt, ...))
+  return res
+end
+
+
+function Compiler:addJmp (label)
+  self:emit("br label %%%s\n", label)
+end
+
+
+function Compiler:codeJmp (ast, labelT, labelF)
+  local tag = ast.tag
+  if tag == "not" then
+    self:codeJmp(ast.e, labelF, labelT)
+  elseif tag == "conj" then
+    local label2 = self:newlabel()
+    self:codeJmp(ast.e1, label2, labelF)
+    self:codeLabel(label2)
+    self:codeJmp(ast.e2, labelT, labelF)
+  elseif tag == "disj" then
+    local label2 = self:newlabel()
+    self:codeJmp(ast.e1, labelT, label2)
+    self:codeLabel(label2)
+    self:codeJmp(ast.e2, labelT, labelF)
+  elseif tag == "binopComp" then
+    self:codeExp(ast.e1)
+    self:codeExp(ast.e2)
+    ast.res = self:emit([[%r1 = icmp %s i32 %s, %s
+br i1 %r1, label %%%s, label %%%s
+]], opsComp[ast.op], ast.e1.res, ast.e2.res,labelT,labelF)
+  else
+    self:codeIntExp(ast)
+    self:emit([[
+%r1 = icmp eq i32 %s, 0
+  br i1 %r1, label %%%s, label %%%s
+  ]], ast.res, labelF, labelT)
+  end
+end
+
+
 function Compiler:searchLocal (name)
+  if(self.vars[name]) then
+    return self.vars[name]
+  end
   for i = #self.locals, 1, -1 do
     if self.locals[i].name == name then
       return self.locals[i]
@@ -297,6 +355,18 @@ function Compiler:searchLocal (name)
     end
   end
   return nil
+end
+
+
+local function type2VM (ty)
+  if ty.tag == "basictype" then
+    if ty.ty == "int" then
+      return "i32"
+    end
+  elseif ty.tag == "array" then
+    return type2VM(ty.elem) .. "*"
+  end
+  error("unknown type" .. ty.tag)
 end
 
 
@@ -312,29 +382,32 @@ local function typeEq (t1, t2)
   return false
 end
 
+
+function Compiler:codeAddr (array, index)
+    local tyresVM = type2VM(array.ty.elem)
+    return self:emit([[
+%r1 = getelementptr %s, %s* %s, i32 %s
+    ]], tyresVM, tyresVM, array.res, index.res)
+end
+
+
 function Compiler:codeLhs (ast)
   local tag = ast.tag
   if tag == "var" then
-    local glob = self:searchGlobal(ast.id)
-    if glob == -1 then
-      local loc = self:searchLocal(ast.id)
-      if not loc then
-        self:addCode("storeG", self:name2idx(ast.id))
-      else
-        self:addCode("storeL", loc.idx)
-        return loc.ty
-      end
+    local loc = self:searchLocal(ast.id)
+    if not loc then
+      throw("global not yet implemented")
     else
-      self:addCode("storeL", glob.idx)
-      return glob.ty
+      ast.res = loc.idx
+      return loc.ty
     end
   elseif tag == "indexed" then
     local tyarr = self:codeExp(ast.array)
     if tyarr.tag ~= "array" then
       throw("indexing a non array")
     end
-    self:codeFloatExp(ast.index)
-    self:addCode("setarray")
+    self:codeIntExp(ast.index)
+    ast.res = self:codeAddr(ast.array, ast.index)
     return tyarr.elem
   else error("unknown tag " .. tag)
   end
@@ -342,6 +415,8 @@ end
 
 
 function Compiler:codeCall (ast)
+  local res = self:newreg()
+  ast.res = res
   local func = self.funcs[ast.name]
   if not func then
     throw("calling undefined function: " .. ast.name)
@@ -350,62 +425,92 @@ function Compiler:codeCall (ast)
     throw("wrong number of arguments")
   end
   for i = 1, #ast.args do
-    local tyarg = self:codeExp(ast.args[i])
+    local arg = ast.args[i]
+    local tyarg = self:codeExp(arg)
     if not typeEq(tyarg, func.params[i].ty) then
       throw("invalid parameter type " .. i)
     end
   end
-  self:addCode("call", func.code)
+
+  self:emit("%s = call %s @%s(",
+             res, type2VM(func.retty), ast.name)
+
+  for i = 1, #ast.args do
+    local arg = ast.args[i]
+    if i ~= 1 then self:emit(", ") end
+    self:emit("%s %s", type2VM(arg.ty), arg.res)
+  end
+  self:emit(")\n")
+
   return func.retty
+end
+
+
+function Compiler:codePrint (ast)
+  self:codeExp(ast.e)
+  self:emit([[
+call i32 (i8*, ...) @printf(i8* getelementptr ([4 x i8],
+             [4 x i8]* @.%s, i64 0, i64 0), i32 %s)
+]], (ast.e.ty == "array" and "str.1" or "str"), ast.e.res)
 end
 
 
 function Compiler:codeStat (ast)
   local tag = ast.tag
   if tag == "print" then
-    self:codeExp(ast.e)
-    self:addCode("print")
+    self:codePrint(ast)
   elseif tag == "return" then
     local retty = self:codeExp(ast.e)
     if not typeEq(retty, self.retty) then
       throw("invalid return type")
     end
     self:addCode("ret", #self.params)
+    self:emit("ret %s %s\n", type2VM(ast.e.ty), ast.e.res)
   elseif tag == "call" then
     self:codeCall(ast)
     self:addCode("pop", 1)
   elseif tag == "local" then
-    if not ast.e then
-      self:addCode("push", 0)
-    else
+    local ety = ast.ty
+    local lety = type2VM(ety)
+    ast.idx = self:emit("%r1 = alloca %s\n", lety)
+    if ast.e then
       self:codeExp(ast.e)
+      if not typeEq(ety, ast.ty) then
+        throw("incompatible types")
+      end
+      self:emit("store %s %s, %s* %s\n", lety, ast.e.res, lety, ast.idx)
     end
-    if ast.e and not typeEq(ast.e.ty, ast.ty) then
-      throw("incompatible types")
+    if(self:searchLocal(ast.name)) then
+      throw("existing var name")
     end
     self.locals[#self.locals + 1] = ast
-    ast.idx = #self.locals
   elseif tag == "while" then
-    local target = #self.code
-    local L1 = newlabel()
-    self:codeJmpFalse(ast.cond, L1)
+    local Linit = self:newlabel()
+    self:addJmp(Linit)
+    self:codeLabel(Linit)
+    local Lblock = self:newlabel()
+    local Lend = self:newlabel()
+    self:codeJmp(ast.cond, Lblock, Lend)
+    self:codeLabel(Lblock)
     self:codeStat(ast.block)
-    local L2 = newlabel()
-    self:addJmp("jmp", L2)
-    self:fixlabel2here(L1)
-    self:fixlabel2target(L2, target)
+    self:addJmp(Linit)
+    self:codeLabel(Lend)
   elseif tag == "if" then
-    local L1 = newlabel()
-    self:codeJmpFalse(ast.cond, L1)
+    local Lthen = self:newlabel()
+    local Lelse = self:newlabel()
+    self:codeJmp(ast.cond, Lthen, Lelse)
+    self:codeLabel(Lthen)
     self:codeStat(ast.th)
     if not ast.el then
-      self:fixlabel2here(L1)
+      self:addJmp(Lelse)
+      self:codeLabel(Lelse)
     else
-      local L2 = newlabel()
-      self:addJmp("jmp", L2)
-      self:fixlabel2here(L1)
+      local Lfinal = self:newlabel()
+      self:addJmp(Lfinal)
+      self:codeLabel(Lelse)
       self:codeStat(ast.el)
-      self:fixlabel2here(L2)
+      self:addJmp(Lfinal)
+      self:codeLabel(Lfinal)
     end
   elseif tag == "assg" then
     local tyrhs = self:codeExp(ast.exp)
@@ -413,6 +518,8 @@ function Compiler:codeStat (ast)
     if not typeEq(tyrhs, tylhs) then
       throw("invalid assignment")
     end
+    self:emit("store %s %s, %s* %s\n",
+                type2VM(tylhs), ast.exp.res, type2VM(tylhs), ast.lhs.res)
   elseif tag == "block" then
     local nvars = #self.locals
     for i = 1, #ast.body do
@@ -428,72 +535,112 @@ function Compiler:codeStat (ast)
 end
 
 
-function Compiler:codeFloatExp (ast)
+function Compiler:codeIntExp (ast)
   local ty = self:codeExp(ast)
-  if ty.tag ~= "basictype" or ty.ty ~= "float" then
+  if ty.tag ~= "basictype" or ty.ty ~= "int" then
     throw("expression not a number (" .. ast.tag .. ")")
   end
 end
+
+function Compiler:codeShortCircuit (ast, comp)
+  self:codeIntExp(ast.e1)
+  local label1 = self.currentlabel
+  local labelelse = self:newlabel()
+  local labelfinal = self:newlabel()
+  self:emit([[
+%r1 = icmp %s i32 %s, 0
+Wbr i1 %r1, label %%%s, label %%%s
+]], comp, ast.e1.res, labelelse, labelfinal)
+  self:codeLabel(labelelse)
+  self:codeIntExp(ast.e2)
+  local label2 = self.currentlabel
+  self:emit("br label %%%s\n", labelfinal)
+  self:codeLabel(labelfinal)
+  ast.res = self:emit([[
+%r1 = phi i32 [ %s, %%%s ], [ %s, %%%s ]
+  ]], ast.e1.res, label1, ast.e2.res, label2)
+end
+
 
 function Compiler:codeExp (ast)
   local tag = ast.tag
   local ty
   if tag == "number" then
-    self:addCode("push", ast.val)
-    ty = floatTy
-  elseif tag == "var" then
-    local glob = self:searchGlobal(ast.id)
-    if glob == -1 then
-      local loc = self:searchLocal(ast.id)
-      if not loc then
-        self:addCode("loadG", self:name2idx(ast.id))
-      else
-        self:addCode("loadL", loc.idx)
-        return loc.ty
-      end
-    else
-      self:addCode("loadL", glob.idx)
-      return glob.ty
+    ast.res = string.format("%d", ast.val)
+    ty = intTy
+  elseif (tag == "var" or tag=="global") then
+    local loc = self:searchLocal(ast.id)
+    if loc then
+      ty = loc.ty
+      ast.res = self:emit("%r1 = load %s, %s* %s\n",
+                type2VM(ty), type2VM(ty), loc.idx)
+    --else
+     -- self:addCode("loadG", self:name2idx(ast.id))
     end
   elseif tag == "indexed" then
     local aty = self:codeExp(ast.array)
     if aty.tag ~= "array" then
       throw("indexing a non array")
     end
-    self:codeFloatExp(ast.index)
-    self:addCode("getarray")
+    self:codeIntExp(ast.index)
+    local regaddr = self:codeAddr(ast.array, ast.index)
+    local tyresVM = type2VM(aty.elem)
+    ast.res = self:emit([[
+%r1 = load %s, %s* %s
+    ]], tyresVM, tyresVM, regaddr)
     ty = aty.elem
   elseif tag == "newarray" then
-    self:codeFloatExp(ast.size)
-    self:addCode("newarray")
+    local resizep = self:newreg()
+    local resizeI = self:newreg()
+    local tyelem = type2VM(ast.ty)
+    self:emit([[
+%r1 = getelementptr %s, %s* null, i32 1
+%r2 = ptrtoint %s* %s to i64
+]], resizep, type2VM(ast.ty), tyelem, resizeI, tyelem, resizep)
+    local rsize64 = self:newreg()
+    local rsizeB = self:newreg()
+    local pi8 = self:newreg()
+    local pT = self:newreg()
+    self:codeIntExp(ast.size)
+    self:emit([[
+%s = sext i32 %s to i64
+%s = mul i64 %s, %s
+%s = call i8* @malloc(i64 %s)
+%s = bitcast i8* %s to %s*
+]], rsize64, ast.size.res, rsizeB, rsize64,
+    resizeI, pi8, rsizeB, pT, pi8, tyelem)
+    ast.res = pT
     ty = {tag = "array", elem = ast.ty}
   elseif tag == "not" then
-    self:codeFloatExp(ast.e)
-    self:addCode("not")
-    ty = floatTy
+    self:codeIntExp(ast.e)
+    ast.res = self:emit("%r1 = icmp eq i32 %s, 0\n%r2 = zext i1 %r1 to i32\n",
+      ast.e.res)
+    ty = intTy
   elseif tag == "neg" then
-    self:codeFloatExp(ast.e)
-    self:addCode("neg")
-    ty = floatTy
+    local reg = self:newreg()
+    ast.res = reg
+    self:codeIntExp(ast.e)
+    self:emit("%s = sub i32 0, %s\n", reg, ast.e.res)
+    ty = intTy
+  elseif tag =="binopComp" then
+    self:codeIntExp(ast.e1)
+    self:codeIntExp(ast.e2)
+    ty = intTy
+    ast.res = self:emit([[%r1 = icmp %s i32 %s, %s
+%r2 = zext i1 %r1 to i32
+]],opsComp[ast.op], ast.e1.res, ast.e2.res)
   elseif tag == "binop" then
-    self:codeFloatExp(ast.e1)
-    self:codeFloatExp(ast.e2)
-    self:addCode("binop", ast.op)
-    ty = floatTy
+    self:codeIntExp(ast.e1)
+    self:codeIntExp(ast.e2)
+    ty = intTy
+    ast.res = self:emit("%r1 = %s i32 %s, %s\n",
+                  ops[ast.op], ast.e1.res, ast.e2.res)
   elseif tag == "conj" then
-    local label = newlabel()
-    self:codeFloatExp(ast.e1)
-    self:addJmp("andjmp", label)
-    self:codeFloatExp(ast.e2)
-    self:fixlabel2here(label)
-    ty = floatTy
+    self:codeShortCircuit(ast, "ne")
+    ty = intTy
   elseif tag == "disj" then
-    local label = newlabel()
-    self:codeFloatExp(ast.e1)
-    self:addJmp("orjmp", label)
-    self:codeFloatExp(ast.e2)
-    self:fixlabel2here(label)
-    ty = floatTy
+    self:codeShortCircuit(ast, "eq")
+    ty = intTy
   elseif tag == "call" then
     ty = self:codeCall(ast)
   else error("unknown tag " .. tag)
@@ -503,28 +650,65 @@ function Compiler:codeExp (ast)
   return ty
 end
 
+function Compiler:codeGlobal(ast)
+  ast.idx = "@" .. ast.name
+  self:emit("%s = dso_local global i32 0\n\n", ast.idx)
+  self.vars[ast.name] = ast
+end
 
 function Compiler:codeFunc (ast)
-  print("codigo para a funcao",ast.name)
   self.code = {}
   self.locals = {}
   self.params = ast.params
   self.retty = ast.retty
+  self.count = 0
+  local params = ""
   for i = 1, #self.params do
-    self.params[i].idx = -(#self.params - i)
+    local idx = self:newreg()
+    self.params[i].idx = idx
+    if i > 1 then params = params .. ", " end
+    params = string.format("%s%s %s", params, type2VM(ast.params[i].ty), idx)
   end
+  self:emit("define %s @%s (%s) {",
+            type2VM(ast.retty), ast.name, params)
   self.funcs[ast.name] = { code = self.code, params = ast.params, retty = ast.retty }
+  self:codeLabel()
+  for i = 1, #self.params do
+    local param = self.params[i]
+    local addr = count2reg(self:newcount())
+    local pty = type2VM(param.ty)
+    self:emit("%s = alloca %s\n", addr, pty)
+    self:emit("store %s %s, %s* %s\n", pty, param.idx, pty, addr)
+    param.idx = addr
+  end
   self:codeStat(ast.body)
-  self:addCode("push", 0)
-  self:addCode("ret", #self.params)
+  self:emit("ret i32 0\n")
+  self:emit("}\n\n")
 end
 
 function compile (ast)
-  globals = ast[1]
-  idxGlobals()
-  print("tabela de globais",pt.pt(globals))
-  for i = 1, #ast[2] do
-    Compiler:codeFunc(ast[2][i])
+  Compiler:emit[[
+declare i8* @malloc(i64)
+
+@.str = private constant [4 x i8] c"%%d\0A\00"
+@.str.1 = private constant [4 x i8] c"%%p\0A\00"
+declare i32 @printf(i8*, ...)
+
+]]
+  for i = 1, #ast do
+    if ast[i].tag == "global" then 
+      Compiler:codeGlobal(ast[i])
+    end
+    if ast[i].tag =="funcDec" then
+      if Compiler:verifyFn("dec",ast[i]) then
+        Compiler.funcsDec[ast[i].name] = ast[i]
+      end
+    end
+    if ast[i].tag =="func" then
+      if Compiler:verifyFn("fn",ast[i]) then
+        Compiler:codeFunc(ast[i])
+      end
+    end
   end
   local main = Compiler.funcs["main"]
   if not main then
@@ -534,136 +718,12 @@ function compile (ast)
 end
 
 
------------------------------------------------------------
-local binOps = {
-	["+"] = function (a,b) return a + b end,
-	["-"] = function (a,b) return a - b end,
-	["*"] = function (a,b) return a * b end,
-	["/"] = function (a,b) return a / b end,
-	["%"] = function (a,b) return a % b end,
-	["^"] = function (a,b) return a ^ b end,
-	[">="] = function (a,b) return a >= b and 1 or 0 end,
-	[">"] = function (a,b) return a > b and 1 or 0 end,
-	["<="] = function (a,b) return a <= b and 1 or 0 end,
-	["<"] = function (a,b) return a < b and 1 or 0 end,
-	["=="] = function (a,b) return a == b and 1 or 0 end,
-	["~="] = function (a,b) return a ~= b and 1 or 0 end,
-       }
+---------------------------------------------------------------
 
-local trace = false
-
-local function run (code, stack, top, mem)
-  local pc = 1
-  local base = top
-  while true do
-    local op = code[pc]
-    if trace then
-      io.write("---", pc, ":")
-      for i = 1, top do io.write(stack[i] or "nil", " ") end
-      io.write("--> ", op)
-      io.write("\n")
-    end
-    if op == "ret" then
-      pc = pc + 1
-      local finaltop = base + 1 - code[pc]
-      stack[finaltop] = stack[top]
-      return finaltop
-    elseif op == "call" then
-      pc = pc + 1
-      top = run(code[pc], stack, top, mem)
-    elseif op == "print" then
-      print(pt.pt(stack[top]))
-      top = top - 1
-    elseif op == "jmp" then
-      pc = pc + 1
-      pc = pc + code[pc]
-    elseif op == "orjmp" then
-      pc = pc + 1
-      if stack[top] ~= 0 then
-       pc = pc + code[pc]
-     else
-       top = top - 1
-     end
-    elseif op == "andjmp" then
-      pc = pc + 1
-      if stack[top] == 0 then
-       pc = pc + code[pc]
-     else
-       top = top - 1
-     end
-    elseif op == "IfZJmp" then
-      pc = pc + 1
-      if stack[top] == 0 then
-       pc = pc + code[pc]
-     end
-     top = top - 1
-    elseif op == "IfNZJmp" then
-      pc = pc + 1
-      if stack[top] ~= 0 then
-       pc = pc + code[pc]
-     end
-     top = top - 1
-    elseif op == "pop" then
-      pc = pc + 1
-      top = top - code[pc]
-    elseif op == "push" then
-      pc = pc + 1
-      top = top + 1
-      stack[top] = code[pc] + 0.0
-    elseif op == "loadL" then
-      pc = pc + 1
-      top = top + 1
-      stack[top] = stack[base + code[pc]]
-    elseif op == "loadG" then
-      pc = pc + 1
-      top = top + 1
-      stack[top] = mem[code[pc]]
-    elseif op == "storeL" then
-      pc = pc + 1
-      stack[base + code[pc]] = stack[top]
-      top = top - 1
-    elseif op == "storeG" then
-      pc = pc + 1
-      mem[code[pc]] = stack[top]
-      top = top - 1
-    elseif op == "not" then
-      stack[top] = (stack[top] == 0) and 1 or 0
-    elseif op == "newarray" then
-      stack[top] = {size = stack[top]}
-    elseif op == "getarray" then
-      local array = stack[top - 1]
-      local index = stack[top]
-      if index > array.size then throw("index out of bound") end
-      stack[top - 1] = array[index]
-      top = top - 1
-    elseif op == "setarray" then
-      local array = stack[top - 1]
-      local index = stack[top]
-      if index > array.size then throw("index out of bound") end
-      array[index] = stack[top - 2]
-      top = top - 3
-    elseif op == "neg" then
-      stack[top] = -stack[top]
-    elseif op == "binop" then
-      pc = pc + 1
-      stack[top - 1] = binOps[code[pc]](stack[top - 1], stack[top])
-      top = top - 1
-    else error("unknown instruction " .. op)
-    end
-    pc = pc + 1
-  end
-end
------------------------------------------------------------
 local input = io.read("*a")
 for i = 1, #arg do arg[arg[i]] = i end
 local ast = parser(input)
 if arg["-ast"] then print(pt.pt(ast)) end
 local code = compile(ast)
 if arg["-type"] then print(pt.pt(ast, true)) end
-if arg["-code"] then print(pt.pt(code)) end
-local stack = {}
-local mem = {k0 = 0, k1 = 1, k10 = 10}
-if arg["-trace"] then trace = true end
-run(code, stack, 0, mem)
-print(stack[1])
 
